@@ -37,11 +37,32 @@ logger.info(f"OLLAMA_MODEL: {OLLAMA_MODEL}")
 logger.info(f"OLLAMA_API_KEY: {'***set***' if OLLAMA_API_KEY else 'not set'}")
 logger.info(f"SHIM_PORT: {SHIM_PORT}")
 
+# Constants
+class StopReason:
+    """Anthropic API stop reasons."""
+    END_TURN = "end_turn"
+    TOOL_USE = "tool_use"
+
+
+class ContentBlockType:
+    """Anthropic content block types."""
+    TEXT = "text"
+    TOOL_USE = "tool_use"
+
+
+class SSEEventType:
+    """Server-Sent Events event types."""
+    MESSAGE_START = "message_start"
+    CONTENT_BLOCK_START = "content_block_start"
+    CONTENT_BLOCK_DELTA = "content_block_delta"
+    CONTENT_BLOCK_STOP = "content_block_stop"
+    MESSAGE_DELTA = "message_delta"
+    MESSAGE_STOP = "message_stop"
+    ERROR = "error"
+
+
 # Initialize FastAPI app
 app = FastAPI(title="Ollama-Anthropic Shim", version="1.0.0")
-
-# HTTP client for Ollama requests
-http_client = httpx.AsyncClient(timeout=120.0)
 
 
 def truncate_text(text: str, max_length: int = 200) -> str:
@@ -206,6 +227,20 @@ def transform_messages_to_ollama(messages: List[Dict[str, Any]]) -> List[Dict[st
     return ollama_messages
 
 
+def send_sse_event(event_type: str, data: Dict[str, Any]) -> str:
+    """
+    Generate a Server-Sent Events (SSE) formatted message.
+
+    Args:
+        event_type: The event type (e.g., "message_start", "content_block_delta")
+        data: The event data to be JSON-encoded
+
+    Returns:
+        Formatted SSE message string
+    """
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
 def build_anthropic_response(
     ollama_response: Dict[str, Any],
     model: str
@@ -269,7 +304,7 @@ def build_anthropic_response(
             })
 
     # Determine stop_reason
-    stop_reason = "tool_use" if tool_calls else "end_turn"
+    stop_reason = StopReason.TOOL_USE if tool_calls else StopReason.END_TURN
 
     return {
         "id": message_id,
@@ -353,13 +388,25 @@ async def stream_ollama_response(ollama_request: Dict[str, Any], headers: Dict[s
         ) as response:
             if response.status_code != 200:
                 error_text = await response.aread()
-                yield f"event: error\n"
-                yield f"data: {json.dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': error_text.decode()}})}\n\n"
+                yield send_sse_event(SSEEventType.ERROR, {
+                    'type': 'error',
+                    'error': {'type': 'upstream_error', 'message': error_text.decode()}
+                })
                 return
 
             # Send message_start event
-            yield f"event: message_start\n"
-            yield f"data: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': OLLAMA_MODEL, 'stop_reason': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+            yield send_sse_event(SSEEventType.MESSAGE_START, {
+                'type': 'message_start',
+                'message': {
+                    'id': message_id,
+                    'type': 'message',
+                    'role': 'assistant',
+                    'content': [],
+                    'model': OLLAMA_MODEL,
+                    'stop_reason': None,
+                    'usage': {'input_tokens': 0, 'output_tokens': 0}
+                }
+            })
 
             full_content = ""
             full_thinking = ""
@@ -386,15 +433,21 @@ async def stream_ollama_response(ollama_request: Dict[str, Any], headers: Dict[s
 
                     # Start text block on first content
                     if (content_delta or thinking_delta) and not text_block_started:
-                        yield f"event: content_block_start\n"
-                        yield f"data: {json.dumps({'type': 'content_block_start', 'index': current_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                        yield send_sse_event(SSEEventType.CONTENT_BLOCK_START, {
+                            'type': 'content_block_start',
+                            'index': current_block_index,
+                            'content_block': {'type': ContentBlockType.TEXT, 'text': ''}
+                        })
                         text_block_started = True
 
                     if content_delta:
                         full_content += content_delta
                         # Send content_block_delta
-                        yield f"event: content_block_delta\n"
-                        yield f"data: {json.dumps({'type': 'content_block_delta', 'index': current_block_index, 'delta': {'type': 'text_delta', 'text': content_delta}})}\n\n"
+                        yield send_sse_event(SSEEventType.CONTENT_BLOCK_DELTA, {
+                            'type': 'content_block_delta',
+                            'index': current_block_index,
+                            'delta': {'type': 'text_delta', 'text': content_delta}
+                        })
 
                     if thinking_delta:
                         full_thinking += thinking_delta
@@ -404,21 +457,29 @@ async def stream_ollama_response(ollama_request: Dict[str, Any], headers: Dict[s
                         # If content is empty, use thinking
                         if not full_content and full_thinking:
                             if not text_block_started:
-                                yield f"event: content_block_start\n"
-                                yield f"data: {json.dumps({'type': 'content_block_start', 'index': current_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                                yield send_sse_event(SSEEventType.CONTENT_BLOCK_START, {
+                                    'type': 'content_block_start',
+                                    'index': current_block_index,
+                                    'content_block': {'type': ContentBlockType.TEXT, 'text': ''}
+                                })
                                 text_block_started = True
 
-                            yield f"event: content_block_delta\n"
-                            yield f"data: {json.dumps({'type': 'content_block_delta', 'index': current_block_index, 'delta': {'type': 'text_delta', 'text': full_thinking}})}\n\n"
+                            yield send_sse_event(SSEEventType.CONTENT_BLOCK_DELTA, {
+                                'type': 'content_block_delta',
+                                'index': current_block_index,
+                                'delta': {'type': 'text_delta', 'text': full_thinking}
+                            })
 
                         # Close text block if started
                         if text_block_started:
-                            yield f"event: content_block_stop\n"
-                            yield f"data: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
+                            yield send_sse_event(SSEEventType.CONTENT_BLOCK_STOP, {
+                                'type': 'content_block_stop',
+                                'index': current_block_index
+                            })
                             current_block_index += 1
 
                         # Handle tool_calls (use accumulated ones)
-                        stop_reason = "tool_use" if accumulated_tool_calls else "end_turn"
+                        stop_reason = StopReason.TOOL_USE if accumulated_tool_calls else StopReason.END_TURN
 
                         for tool_call in accumulated_tool_calls:
                             # Ollama format: {"function": {"name": "...", "arguments": {}}}
@@ -431,47 +492,48 @@ async def stream_ollama_response(ollama_request: Dict[str, Any], headers: Dict[s
                                 logger.debug(f"Processing tool_call: name={tool_name}, args_type={type(tool_args)}")
 
                                 # Send content_block_start for tool_use
-                                start_event = {
+                                yield send_sse_event(SSEEventType.CONTENT_BLOCK_START, {
                                     'type': 'content_block_start',
                                     'index': current_block_index,
                                     'content_block': {
-                                        'type': 'tool_use',
+                                        'type': ContentBlockType.TOOL_USE,
                                         'id': tool_use_id,
                                         'name': tool_name,
                                         'input': {}
                                     }
-                                }
-                                yield f"event: content_block_start\n"
-                                yield f"data: {json.dumps(start_event)}\n\n"
+                                })
 
                                 # Send content_block_delta with tool input
                                 # Arguments should be serialized to JSON string
                                 args_json = json.dumps(tool_args) if isinstance(tool_args, dict) else str(tool_args)
-                                delta_event = {
+                                yield send_sse_event(SSEEventType.CONTENT_BLOCK_DELTA, {
                                     'type': 'content_block_delta',
                                     'index': current_block_index,
                                     'delta': {
                                         'type': 'input_json_delta',
                                         'partial_json': args_json
                                     }
-                                }
-                                yield f"event: content_block_delta\n"
-                                yield f"data: {json.dumps(delta_event)}\n\n"
+                                })
 
                                 # Send content_block_stop for tool_use
-                                stop_event = {'type': 'content_block_stop', 'index': current_block_index}
-                                yield f"event: content_block_stop\n"
-                                yield f"data: {json.dumps(stop_event)}\n\n"
+                                yield send_sse_event(SSEEventType.CONTENT_BLOCK_STOP, {
+                                    'type': 'content_block_stop',
+                                    'index': current_block_index
+                                })
 
                                 current_block_index += 1
 
                         # Send message_delta
-                        yield f"event: message_delta\n"
-                        yield f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': 0}})}\n\n"
+                        yield send_sse_event(SSEEventType.MESSAGE_DELTA, {
+                            'type': 'message_delta',
+                            'delta': {'stop_reason': stop_reason},
+                            'usage': {'output_tokens': 0}
+                        })
 
                         # Send message_stop
-                        yield f"event: message_stop\n"
-                        yield f"data: {json.dumps({'type': 'message_stop'})}\n\n"
+                        yield send_sse_event(SSEEventType.MESSAGE_STOP, {
+                            'type': 'message_stop'
+                        })
                         break
 
                 except json.JSONDecodeError:
@@ -540,36 +602,37 @@ async def create_message(request: Request):
 
         # Call Ollama (non-streaming)
         try:
-            ollama_response = await http_client.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json=ollama_request,
-                headers=headers
-            )
-
-            # Log truncated Ollama response
-            response_text = ollama_response.text
-            logger.info(f"Ollama response: {truncate_text(response_text, 200)}")
-
-            # Handle non-200 responses from Ollama
-            if ollama_response.status_code != 200:
-                error_message = ollama_response.text
-                return JSONResponse(
-                    status_code=ollama_response.status_code,
-                    content={
-                        "error": {
-                            "type": "upstream_error",
-                            "message": error_message
-                        }
-                    }
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                ollama_response = await client.post(
+                    f"{OLLAMA_BASE_URL}/api/chat",
+                    json=ollama_request,
+                    headers=headers
                 )
 
-            # Parse Ollama response
-            ollama_data = ollama_response.json()
+                # Log truncated Ollama response
+                response_text = ollama_response.text
+                logger.info(f"Ollama response: {truncate_text(response_text, 200)}")
 
-            # Transform to Anthropic format
-            anthropic_response = build_anthropic_response(ollama_data, OLLAMA_MODEL)
+                # Handle non-200 responses from Ollama
+                if ollama_response.status_code != 200:
+                    error_message = ollama_response.text
+                    return JSONResponse(
+                        status_code=ollama_response.status_code,
+                        content={
+                            "error": {
+                                "type": "upstream_error",
+                                "message": error_message
+                            }
+                        }
+                    )
 
-            return JSONResponse(content=anthropic_response)
+                # Parse Ollama response
+                ollama_data = ollama_response.json()
+
+                # Transform to Anthropic format
+                anthropic_response = build_anthropic_response(ollama_data, OLLAMA_MODEL)
+
+                return JSONResponse(content=anthropic_response)
 
         except httpx.RequestError as e:
             logger.error(f"Error connecting to Ollama: {e}")
