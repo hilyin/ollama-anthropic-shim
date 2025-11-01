@@ -27,6 +27,20 @@ Claude Code is designed to communicate with the Anthropic API. This shim allows 
 - ✅ Comprehensive logging with request/response truncation
 - ✅ MiniMax M2 reasoning model support (thinking field handling)
 
+## Important Note: Ollama Cloud Free Tier Limitations
+
+**⚠️ Claude Code Compatibility Issue with Ollama Cloud Free Tier**
+
+While this shim works perfectly for simple requests, **Claude Code sends very large requests** (18KB+ system prompts, 20+ tool definitions, multi-turn conversation history) that frequently exceed Ollama Cloud's free tier limits, resulting in `500 Internal Server Error` responses.
+
+**Recommendations:**
+- ✅ **Use local Ollama** - Install Ollama locally for unlimited usage with models like llama3.1, qwen2.5, or mistral
+- ⏳ **Wait for paid tier** - Ollama Cloud paid plans (after free trial) may have higher limits
+- ⚠️ **Free tier works for:** Simple API calls, testing, small conversations
+- ❌ **Free tier struggles with:** Claude Code's full feature set (agents, tools, long contexts)
+
+**Testing:** The shim itself is production-ready - the limitation is upstream in Ollama Cloud's free tier capacity.
+
 ## Prerequisites
 
 Before you begin, ensure you have:
