@@ -17,13 +17,15 @@ Claude Code is designed to communicate with the Anthropic API. This shim allows 
 ## Features
 
 - ✅ Full Anthropic Messages API v1 compatibility
+- ✅ Streaming support with Server-Sent Events (SSE)
+- ✅ Tool calling (function calling) support with automatic format conversion
 - ✅ Automatic request/response translation
 - ✅ Handles text content, system messages, and multi-turn conversations
 - ✅ Configurable via environment variables
 - ✅ Docker-based deployment
 - ✅ Health check endpoint
 - ✅ Comprehensive logging with request/response truncation
-- ⚠️ Streaming not yet implemented (returns 400 error)
+- ✅ MiniMax M2 reasoning model support (thinking field handling)
 
 ## Prerequisites
 
@@ -227,30 +229,93 @@ curl -X POST http://localhost:4001/v1/messages \
 
 **Note**: Token counts are placeholders (Ollama doesn't provide them).
 
-### Test 3: Streaming (Should Fail)
+### Test 3: Streaming Support
 
 ```bash
 curl -X POST http://localhost:4001/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-3-5-sonnet",
-    "messages": [{"role": "user", "content": "test"}],
+    "messages": [{"role": "user", "content": "Count from 1 to 5"}],
     "max_tokens": 100,
     "stream": true
   }'
 ```
 
-**Expected response** (400 error):
+**Expected response** (Server-Sent Events stream):
+```
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_...","type":"message","role":"assistant","content":[],"model":"minimax-m2:cloud","stop_reason":null,"usage":{"input_tokens":0,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"1"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" 2 3 4 5"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}
+
+event: message_stop
+data: {"type":"message_stop"}
+```
+
+### Test 4: Tool Calling
+
+```bash
+curl -X POST http://localhost:4001/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-3-5-sonnet",
+    "messages": [
+      {"role": "user", "content": "What is the weather in San Francisco?"}
+    ],
+    "max_tokens": 256,
+    "stream": false,
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather in a location",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string", "description": "The city and state"}
+          },
+          "required": ["location"]
+        }
+      }
+    ]
+  }'
+```
+
+**Expected response** includes tool_use blocks when the model decides to use tools:
 ```json
 {
-  "error": {
-    "type": "streaming_not_implemented",
-    "message": "set stream=false"
-  }
+  "id": "msg_...",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {"type": "text", "text": "I'll check the weather for you."},
+    {
+      "type": "tool_use",
+      "id": "toolu_...",
+      "name": "get_weather",
+      "input": {"location": "San Francisco, CA"}
+    }
+  ],
+  "stop_reason": "tool_use",
+  "model": "minimax-m2:cloud",
+  "usage": {"input_tokens": 0, "output_tokens": 0}
 }
 ```
 
-### Test 4: With Claude Code
+### Test 5: With Claude Code
 
 1. Ensure the shim is running: `./up.sh`
 2. Configure `~/.claude/settings.json` (see above)
@@ -290,15 +355,19 @@ You should see request/response logs and get a response from MiniMax M2.
 
 **Request transformation**:
 - `model` → Ignored, always uses `OLLAMA_MODEL`
-- `messages` → Extracted text from content blocks
-- `max_tokens` → `options.num_predict`
+- `messages` → Extracted text from content blocks, tool_result → tool messages
+- `max_tokens` → `options.num_predict` (defaults to 4096 for reasoning models if not specified)
 - `temperature` → `options.temperature`
 - `top_p` → `options.top_p`
+- `tools` → Ollama tools format (input_schema → parameters)
 
 **Response transformation**:
 - Ollama `message.content` → Anthropic `content[0].text`
-- Generates fake UUID for message `id`
+- Ollama `message.thinking` → Anthropic content text (fallback for reasoning models like MiniMax M2)
+- Ollama `tool_calls` → Anthropic `tool_use` blocks
+- Generates fake UUID for message `id` and tool use IDs
 - Adds required Anthropic fields: `type`, `stop_reason`, `usage`
+- Sets `stop_reason: "tool_use"` when tools are called, otherwise `"end_turn"`
 
 ## Troubleshooting
 
@@ -368,21 +437,19 @@ docker compose restart shim
 
 ## Limitations
 
-1. **Streaming not implemented**: Requests with `stream: true` return 400 error
-2. **Tool calling not supported**: Tool-related fields are ignored
-3. **Token counts are placeholders**: Always returns 0 (Ollama doesn't provide them)
-4. **Model name mapping**: All model names map to `OLLAMA_MODEL` env var
-5. **macOS/Docker only**: Uses `host.docker.internal` for Mac Docker Desktop
+1. **Token counts are placeholders**: Always returns 0 (Ollama doesn't provide them)
+2. **Model name mapping**: All model names map to `OLLAMA_MODEL` env var
+3. **macOS/Docker only**: Uses `host.docker.internal` for Mac Docker Desktop
+4. **Ollama Cloud request size limits**: Very large requests (18KB+ system prompts, 20+ tools) may cause 500 errors from Ollama Cloud
 
 ## Future Enhancements
 
-- [ ] Implement streaming support with server-sent events (SSE)
 - [ ] Add actual token counting (estimate from text length)
 - [ ] Support multiple model mappings (map claude-opus → llama3, etc.)
 - [ ] Add request caching
 - [ ] Add metrics and monitoring endpoints
-- [ ] Support tool calling (function calling)
 - [ ] Add rate limiting
+- [ ] Improve error handling for Ollama Cloud request size limits
 
 ## Project Structure
 
@@ -394,21 +461,23 @@ docker compose restart shim
 ├── Dockerfile            # Container definition
 ├── docker-compose.yml    # Docker Compose config
 ├── .dockerignore         # Docker build exclusions
+├── .env.example          # Environment variables template
+├── .gitignore            # Git exclusions
 ├── up.sh                 # Start the shim
 ├── down.sh               # Stop the shim
 ├── rebuild.sh            # Rebuild from scratch
-├── README.md             # This file
-└── plan.txt              # Implementation checklist
+└── README.md             # This file
 ```
 
 ## Contributing
 
-This is a minimal implementation focused on core functionality. Contributions welcome for:
-- Streaming support
+This is a production-ready implementation with full streaming and tool calling support. Contributions welcome for:
 - Additional model mappings
-- Better error handling
+- Better error handling for Ollama Cloud limits
 - Token count estimation
+- Request caching
 - Tests
+- Rate limiting
 
 ## License
 
